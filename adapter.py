@@ -5,7 +5,8 @@
 
 # Author: Yiyang Zhou 
 # Email: yiyang.zhou@berkeley.edu
-
+FILE_NAME_LEN = 9
+DONT_CARE = 'DontCare'
 print('\nLoading files...')
 
 import argoverse
@@ -78,9 +79,58 @@ def load_ply(ply_fpath: _PathLike) -> np.ndarray:
 
     return np.concatenate((x, y, z), axis=1)
 
+def write_split_file(split_file_path, offset, num_sample):
+    """
+    Generate indices in the range of [offset, offset + num_sample] and write them
+    to a file.
+    Args:
+        split_file_path:
+        offset:
+        num_sample:
+
+    Returns:
+
+    """
+    # first make sure its parent directory exist
+    dir_name = os.path.dirname(split_file_path)
+    os.makedirs(dir_name, exist_ok=True)
+
+    # generate the indices
+    indices = list(range(offset, offset + num_sample))
+    indices = [str(i).zfill(FILE_NAME_LEN) for i in indices]
+    s = '\n'.join(indices)
+
+    # write to file
+    with open(split_file_path, 'w')as f:
+        f.write(s)
+
+def construct_calib_str(calibration_data):
+    """
+    convert the argo calib to KITTI format, and return the kitti calib as a string.
+    Args:
+        calibration_data: an object of class argoverse.utils.calibration.Calibration
+    """
+    L3 = 'P2: '
+    for j in calibration_data.K.reshape(1, 12)[0]:
+        L3 = L3 + str(j) + ' '
+    L3 = L3[:-1]
+
+    L6 = 'Tr_velo_to_cam: '
+    for k in calibration_data.extrinsic.reshape(1, 16)[0][0:12]:
+        L6 = L6 + str(k) + ' '
+    L6 = L6[:-1]
+
+    L1 = 'P0: 0 0 0 0 0 0 0 0 0 0 0 0'
+    L2 = 'P1: 0 0 0 0 0 0 0 0 0 0 0 0'
+    L4 = 'P3: 0 0 0 0 0 0 0 0 0 0 0 0'
+    L5 = 'R0_rect: 1 0 0 0 1 0 0 0 1'
+    L7 = 'Tr_imu_to_velo: 0 0 0 0 0 0 0 0 0 0 0 0'
+
+    file_content = "\n".join([L1, L2, L3, L4, L5, L6, L7])
+    return file_content
+
 def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
     """
-
     Args:
         data_dir: directory that contains data corresponding to A SPECIFIC
             SPLIT (train, validation, test)
@@ -91,18 +141,21 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
             training and validation sample_idx because in KITTI they are under
             the same dir
     """
+    print("Processing", data_dir)
 
     target_velodyne_dir = os.path.join(target_data_dir, 'velodyne')
     target_velodyne_reduced_dir = os.path.join(target_data_dir, 'velodyne_reduced')
     target_calib_dir = os.path.join(target_data_dir, 'calib')
     target_image_2_dir = os.path.join(target_data_dir, 'image_2')
-    target_label_2_dir = os.path.join(target_data_dir, 'label_2')
+    if 'test' not in split_file_path:
+        target_label_2_dir = os.path.join(target_data_dir, 'label_2')
 
     os.makedirs(target_velodyne_dir, exist_ok=True)
     os.makedirs(target_velodyne_reduced_dir, exist_ok=True)
     os.makedirs(target_calib_dir, exist_ok=True)
     os.makedirs(target_image_2_dir, exist_ok=True)
-    os.makedirs(target_label_2_dir, exist_ok=True)
+    if 'test' not in split_file_path:
+        os.makedirs(target_label_2_dir, exist_ok=True)
 
     # Check the number of logs, defined as one continuous trajectory
     argoverse_loader = ArgoverseTrackingLoader(data_dir)
@@ -110,23 +163,27 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
     argoverse_loader.print_all()
     print('\n')
 
-    cams = ['ring_front_center',
-            'ring_front_left',
-            'ring_front_right',
-            'ring_rear_left',
-            'ring_rear_right',
-            'ring_side_left',
-            'ring_side_right']
+    cams = [
+        'ring_front_center',
+        # 'ring_front_left',
+        # 'ring_front_right',
+        # 'ring_rear_left',
+        # 'ring_rear_right',
+        # 'ring_side_left',
+        # 'ring_side_right'
+    ]
 
     # count total number of files
     total_number = 0
-    # import pdb;pdb.set_trace()
     for q in argoverse_loader.log_list:
         log_lidar_path = os.path.join(data_dir, q, 'lidar')
         path, dirs, files = next(os.walk(log_lidar_path))
         total_number = total_number + len(files)
 
-    total_number = total_number * 7
+    total_number = total_number * len(cams)
+
+    print('Now write sample indices to split file.')
+    write_split_file(split_file_path, offset, total_number)
 
     bar = progressbar.ProgressBar(maxval=total_number, \
                                   widgets=[progressbar.Bar('=', '[', ']'), ' ', progressbar.Percentage()])
@@ -135,37 +192,15 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
     print('Progress:')
     bar.start()
 
-    i = offset
-    for log_id in argoverse_loader.log_list:
+    i = 0
+    for log_id in sorted(argoverse_loader.log_list):
         argoverse_data = argoverse_loader.get(log_id)
         for cam in cams:
             # Recreate the calibration file content
             log_calib_path = os.path.join(data_dir, log_id, 'vehicle_calibration_info.json')
             calibration_data = calibration.load_calib(log_calib_path)[cam]
-            L3 = 'P2: '
-            for j in calibration_data.K.reshape(1, 12)[0]:
-                L3 = L3 + str(j) + ' '
-            L3 = L3[:-1]
+            calib_file_content = construct_calib_str(calibration_data)
 
-            L6 = 'Tr_velo_to_cam: '
-            for k in calibration_data.extrinsic.reshape(1, 16)[0][0:12]:
-                L6 = L6 + str(k) + ' '
-            L6 = L6[:-1]
-
-            L1 = 'P0: 0 0 0 0 0 0 0 0 0 0 0 0'
-            L2 = 'P1: 0 0 0 0 0 0 0 0 0 0 0 0'
-            L4 = 'P3: 0 0 0 0 0 0 0 0 0 0 0 0'
-            L5 = 'R0_rect: 1 0 0 0 1 0 0 0 1'
-            L7 = 'Tr_imu_to_velo: 0 0 0 0 0 0 0 0 0 0 0 0'
-
-            file_content = """{}
-    {}
-    {}
-    {}
-    {}
-    {}
-    {}
-         """.format(L1, L2, L3, L4, L5, L6, L7)
             l = 0
 
             log_lidar_dir = os.path.join(data_dir, log_id, 'lidar')
@@ -173,7 +208,11 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
             # Loop through the each lidar frame (10Hz) to copy and reconfigure all images, lidars, calibration files, and label files.
             for timestamp in argoverse_data.lidar_timestamp_list:
 
-                idx = str(i).zfill(9)
+                # import pdb;pdb.set_trace()
+                idx = str(i + offset).zfill(9)
+                i += 1
+                if i < total_number:
+                    bar.update(i + 1)
 
                 # Save lidar file into .bin format under the new directory
                 lidar_file_path = os.path.join(log_lidar_dir, 'PC_{}.ply'.format(str(timestamp)))
@@ -191,16 +230,23 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
 
                 target_calib_file_path = os.path.join(target_calib_dir, idx + '.txt')
                 file = open(target_calib_file_path, 'w+')
-                file.write(file_content)
+                file.write(calib_file_content)
                 file.close()
 
+                if 'test' in split_file_path:
+                    continue
                 label_object_list = argoverse_data.get_label_object(l)
                 target_label_2_file_path = os.path.join(target_label_2_dir, idx + '.txt')
                 file = open(target_label_2_file_path, 'w+')
                 l += 1
 
+                # DontCare objects must appear at the end in KITTI
+                object_lines = []
+                dontcare_lines = []
+
                 for detected_object in label_object_list:
                     classes = detected_object.label_class
+                    classes = OBJ_CLASS_MAPPING_DICT[classes] # map class type from artoverse to KITTI
                     occulusion = round(detected_object.occlusion / 25)
                     height = detected_object.height
                     length = detected_object.length
@@ -254,11 +300,19 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
                                 center_cam_frame[0][0], 2), round(center_cam_frame[0][1], 2) + height / 2, round(center_cam_frame[0][2],
                                                                                                     2), round(angle, 2))
 
-                        file.write(line)
+
+                        # separate the object lines so we can move all the dontcare lines at the end
+                        if classes == DONT_CARE:
+                            dontcare_lines.append(line)
+                        else:
+                            object_lines.append(line)
+
+                for line in object_lines:
+                    file.write(line)
+                for line in dontcare_lines:
+                    file.write(line)
                 file.close()
-                i += 1
-                if i < total_number:
-                    bar.update(i + 1)
+
     bar.finish()
     print('Translation finished, processed {} files'.format(i))
 
@@ -271,10 +325,31 @@ root_dir = '/data/ck/data/argoverse/argoverse-tracking'
 max_d = 50
 split = "train"  # one of train, val, and test
 
-# for local testing
-root_dir = '/Users/ck/data_local/argo/argoverse-tracking'
-target_dir = root_dir + '-kitti-format'
-split = "sample"
+# argoverse object class to KITTI
+car = 'Car'
+ped = 'Pedestrian'
+cyc = 'Cyclist'
+
+# essentially only keep standard sized car, pedestrians, and cyclist.
+OBJ_CLASS_MAPPING_DICT = {
+    "VEHICLE": car,
+    "PEDESTRIAN": ped,
+    "BICYCLIST": cyc,
+    "EMERGENCY_VEHICLE": DONT_CARE,
+    "BUS": DONT_CARE,
+    "LARGE_VEHICLE": DONT_CARE,
+    "ON_ROAD_OBSTACLE": DONT_CARE,
+    "BICYCLE": DONT_CARE,
+    "OTHER_MOVER": DONT_CARE,
+    "TRAILER": DONT_CARE,
+    "MOTORCYCLIST": DONT_CARE,
+    "MOPED": DONT_CARE,
+    "MOTORCYCLE": DONT_CARE,
+    "STROLLER": DONT_CARE,
+    "ANIMAL": DONT_CARE,
+    "WHEELCHAIR": DONT_CARE,
+    "SCHOOL_BUS": DONT_CARE,
+}
 ####################################################################
 
 
@@ -282,25 +357,27 @@ root_dir = '/data/ck/data/argoverse/argoverse-tracking'
 target_dir = '/data/ck/data/argoverse/argoverse-tracking-kitti-format'
 split_pairs = {
     'train': 'training',
-    'val': 'training', # in KITTI, validation data is also in training
+    'val': 'training',  # in KITTI, validation data is also in training
     'test': 'testing'
 }
-image_set_dir = '/data/ck/data/argoverse/argoverse-tracking/ImageSets'
+image_set_dir = '/data/ck/data/argoverse/argoverse-tracking-kitti-format/ImageSets'
 
-root_dir = '/Users/ck/data_local/argo/argoverse-tracking'
-target_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format'
-split_pairs = {
-    'sample': 'sample',
-}
-image_set_dir = '/Users/ck/data_local/argo/argoverse-tracking/ImageSets'
+# # for local testing
+# root_dir = '/Users/ck/data_local/argo/argoverse-tracking'
+# target_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format'
+# split_pairs = {
+#     'sample': 'sample',
+# }
+# image_set_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format/ImageSets'
+
 for k, (src_split, target_split) in enumerate(split_pairs.items()):
     data_dir = os.path.join(root_dir, src_split)
     target_data_dir = os.path.join(target_dir, target_split)
-    split_file_path = os.path.join(image_set_dir, src_split)
+    split_file_path = os.path.join(image_set_dir, src_split + '.txt')
     offset = k * 100000000
     process_a_split(data_dir, target_data_dir, split_file_path, offset)
-    break
 
 """
-python ~/BEVSEG/argoverse-kitti-adapter/adapter.py
+rm -r ~/data_local/argo/argoverse-tracking-kitti-format/; python ~/BEVSEG/argoverse-kitti-adapter/adapter.py
+rm -r /data/ck/data/argoverse/argoverse-tracking-kitti-format/; python ~/BEVSEG/argoverse-kitti-adapter/adapter.py
 """
