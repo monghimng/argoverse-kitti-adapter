@@ -158,9 +158,43 @@ def replace_nan_by_closest(Data):
 def has_nan(arr):
     return np.isnan(arr).any()
 
-def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_per_pixel, drivable_save_path,
-            wanted_classes, wanted_save_paths, visualize=True):
+from scipy.spatial import Delaunay
 
+def in_hull(p, hull):
+    """
+    :param p: (N, K) test points
+    :param hull: (M, K) M corners of a box
+    :return (N) bool
+    """
+    try:
+        if not isinstance(hull, Delaunay):
+            hull = Delaunay(hull)
+        flag = hull.find_simplex(p) >= 0
+    except scipy.spatial.qhull.QhullError:
+        print('Warning: not a hull %s' % str(hull))
+        flag = np.zeros(p.shape[0], dtype=np.bool)
+
+    return flag
+
+# testing coding for in_hull
+# bbox = np.array([
+#     [0, 0],
+#     [0, 1],
+#     [1, 1],
+#     [1, 0],
+# ])
+# pts = np.array([
+#     [0.5, 0.5],
+#     [2, 0.5]
+# ])
+# in_hull(pts, bbox)
+
+def has_pts_in_bbox(pts, bbox, threshold=1):
+    return in_hull(pts, bbox).sum() >= threshold
+
+
+def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_per_pixel, drivable_save_path,
+            wanted_classes, wanted_save_paths, fov_save_path, visualize=True, filter_obj_if_no_pt_bbox=True):
     # output bev image setting
     bnd_width = bnds[1] - bnds[0]
     bnd_height = bnds[3] - bnds[2]
@@ -178,6 +212,38 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
 
     bev_drivable = pygame.Surface([img_height, img_width])
     bev_all = pygame.Surface([img_height, img_width])
+    bev_fov = pygame.Surface([img_height, img_width])
+
+    ############################## construct the fov mask (1 for bev pixels within camera fov)
+    img_width = 1920
+
+    # pick 4 points in the image coordinate also with the depths to define the 4 corners of the fov
+    # uv_depth, where u is the width of the image, v is height of image, depth is how far that obj is
+    fov_corners_uv_depth = np.array([
+        [0, 0, 0.01],  # upper left hand corner of the image, at depth 0.01 meter
+        [0, 0, 100],  # upper left hand corner of the image, at depth 100 meter
+        [img_width - 1, 0, 100],  # upper right hand corner of the image, at depth 100 meter
+        [img_width - 1, 0, 0.01],  # upper right hand corner of the image, at depth 0.01 meter
+        #         [960, 600, 100],
+    ])
+    calib = argoverse_data.get_calibration('ring_front_center')
+    fov_corners_ego = calib.project_image_to_ego(fov_corners_uv_depth)[:, :2]  # discard the z (height)
+
+    # in the ego coord, +x is going forward and +y is to the left, but in BEV image
+    # we expect +x (increment in rows) is going down and +y is to the right.
+    # Therefore, we flip both coordinate
+    fov_corners_ego *= -1
+
+    # move origin to the center of the image
+    fov_corners_ego += np.array(bnd_height // 2, bnd_width)
+
+    # now in the coordinate sys of bev pixels
+    fov_corners_bev = fov_corners_ego / meter_per_pixel
+
+    # draw on the surface
+    pygame.draw.polygon(bev_fov, [255, 0, 0], fov_corners_bev)
+
+    ############################## drawing the drivable regions
     for poly_city in polys[1:]:
 
         # for some reason, the height dimension of the polygons sometimes might have NaN values
@@ -191,7 +257,7 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
         # project to 2d plane, now of shape [n, 2]
         poly_ego_projected = np.array(poly_ego[:, :2])
 
-        # in the ego coord, +x is going up and +y is to the left, but in BEV image
+        # in the ego coord, +x is going forward and +y is to the left, but in BEV image
         # we expect +x (increment in rows) is going down and +y is to the right.
         # Therefore, we flip both coordinate
         poly_ego_projected *= -1
@@ -206,17 +272,32 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
         pygame.draw.polygon(bev_drivable, [255, 0, 0], pixels)
         pygame.draw.polygon(bev_all, [255, 0, 0], pixels)
 
+    ############################## drawing the objects of each classes
+
     # get the objects of a frame
-    object_records = argoverse_data.get_label_object(frame_index)
+    object_records_all = argoverse_data.get_label_object(frame_index)
+
+    # filter out objects that no lidar points lie inside its bbox
+    if filter_obj_if_no_pt_bbox:
+        pts = argoverse_data.get_lidar(frame_index)
+        object_records_all_filtered = [r for r in object_records_all if has_pts_in_bbox(pts, r.as_3d_bbox())]
+        # print(len(object_records_all_filtered) / len(object_records_all))
+        object_records_all = object_records_all_filtered
 
     bev_classes = []  # object class name mapped to the surface of that class
     for object_cls in wanted_classes:
 
         bev = pygame.Surface([img_height, img_width])
 
+        # filter out other classes
+        object_records = [r for r in object_records_all if r.label_class == object_cls]
+        #         for r in object_records:
+        #             if r.occlusion:
+        #                 print(r.occlusion)
+
         # get 8 corners of each object
         # bboxes_corners is of shape [N, 8, 3] where N is the num of objects and 8 are the 8 corners
-        bboxes_corners = np.array([r.as_3d_bbox() for r in object_records if r.label_class == object_cls])
+        bboxes_corners = np.array([r.as_3d_bbox() for r in object_records])
 
         # in case there were no object of that class, we still generate empty bev image
         if len(bboxes_corners) > 0:
@@ -246,6 +327,8 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
 
         bev_classes.append(bev)
 
+    ############################## save to disk if paths are supplied
+
     # save drivable bev images to paths
     if drivable_save_path:
         # convert the pygame surface to binary array
@@ -257,6 +340,12 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
         img_drivable = 1 - img_drivable
 
         cv2.imwrite(drivable_save_path, img_drivable)
+
+    if fov_save_path:
+        # convert the pygame surface to binary array
+        img_fov = pygame.surfarray.array2d(bev_fov)
+        img_fov[img_fov != 0] = 1
+        cv2.imwrite(fov_save_path, img_fov)
 
     # save bev images to paths, for all wanted classes
     if wanted_save_paths:
@@ -274,9 +363,14 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
         plt.figure()
         plt.imshow(img)
 
+        img = pygame.surfarray.array3d(bev_fov)
+        plt.figure()
+        plt.imshow(img)
+
         import argoverse.visualization.visualization_utils as viz_util
         f, ax = viz_util.make_grid_ring_camera(argoverse_data, frame_index)
         plt.show()
+
 
 def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_meter_per_pixel,
                     bev_wanted_classes, offset=0):
@@ -314,6 +408,10 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
     ############################## for BEV segmentation masks
     target_bev_drivable_dir = os.path.join(target_data_dir, 'bev_DRIVABLE')
     os.makedirs(target_bev_drivable_dir, exist_ok=True)
+
+    target_bev_fov_dir = os.path.join(target_data_dir, 'bev_FOV')
+    os.makedirs(target_bev_fov_dir, exist_ok=True)
+
     target_bev_cls_dirs = []
     for wanted_cls in bev_wanted_classes:
         target_bev_cls_dir = os.path.join(target_data_dir, 'bev_{}'.format(wanted_cls))
@@ -384,34 +482,39 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
                 if i < total_number:
                     bar.update(i + 1)
 
-                ############################## Lidar ##############################
-
-                # Save lidar file into .bin format under the new directory
-                lidar_file_path = os.path.join(log_lidar_dir, 'PC_{}.ply'.format(str(timestamp)))
-                target_lidar_file_path = os.path.join(target_velodyne_dir, idx + '.bin')
-
-                lidar_data = load_ply(lidar_file_path)
-                lidar_data_augmented = np.concatenate((lidar_data, np.zeros([lidar_data.shape[0], 1])), axis=1)
-                lidar_data_augmented = lidar_data_augmented.astype('float32')
-                lidar_data_augmented.tofile(target_lidar_file_path)
-
-                ############################## Image ##############################
-
-                # Save the image file into .png format under the new directory
-                cam_file_path = argoverse_data.image_list_sync[cam][frame_idx]
-                target_cam_file_path = os.path.join(target_image_2_dir, idx + '.png')
-                copyfile(cam_file_path, target_cam_file_path)
-
-                target_calib_file_path = os.path.join(target_calib_dir, idx + '.txt')
-                file = open(target_calib_file_path, 'w+')
-                file.write(calib_file_content)
-                file.close()
+                # ############################## Lidar ##############################
+                #
+                # # Save lidar file into .bin format under the new directory
+                # lidar_file_path = os.path.join(log_lidar_dir, 'PC_{}.ply'.format(str(timestamp)))
+                # target_lidar_file_path = os.path.join(target_velodyne_dir, idx + '.bin')
+                #
+                # lidar_data = load_ply(lidar_file_path)
+                # lidar_data_augmented = np.concatenate((lidar_data, np.zeros([lidar_data.shape[0], 1])), axis=1)
+                # lidar_data_augmented = lidar_data_augmented.astype('float32')
+                # lidar_data_augmented.tofile(target_lidar_file_path)
+                #
+                # ############################## Image ##############################
+                #
+                # # Save the image file into .png format under the new directory
+                # cam_file_path = argoverse_data.image_list_sync[cam][frame_idx]
+                # target_cam_file_path = os.path.join(target_image_2_dir, idx + '.png')
+                # copyfile(cam_file_path, target_cam_file_path)
+                #
+                # target_calib_file_path = os.path.join(target_calib_dir, idx + '.txt')
+                # file = open(target_calib_file_path, 'w+')
+                # file.write(calib_file_content)
+                # file.close()
 
                 ############################## BEV binary masks ##############################
                 bev_drivable_save_path = os.path.join(target_bev_drivable_dir, idx + '.png')
                 bev_wanted_save_paths = [os.path.join(cls_dir, idx + '.png') for cls_dir in target_bev_cls_dirs]
+                bev_fov_save_path = os.path.join(target_bev_fov_dir, idx + '.png')
+
                 get_bev(argoverse_data, argoverse_map, log_id, frame_idx, bev_bnds, bev_meter_per_pixel,
-                        bev_drivable_save_path, bev_wanted_classes, bev_wanted_save_paths, visualize=False)
+                        bev_drivable_save_path, bev_wanted_classes, bev_wanted_save_paths, bev_fov_save_path,
+                        visualize=False)
+                
+                continue
 
                 ############################## Labels ##############################
 
@@ -562,13 +665,13 @@ if __name__ == '__main__':
     ]
 
     root_dir = '/data/ck/data/argoverse/argoverse-tracking'
-    target_dir = '/data/ck/data/argoverse/argoverse-tracking-kitti-format'
+    target_dir = '/data/ck/data/argoverse/argoverse-tracking-kitti-format2'
     split_pairs = {
         'train': 'training',
         'val': 'training',  # in KITTI, validation data is also in training
         'test': 'testing'
     }
-    image_set_dir = '/data/ck/data/argoverse/argoverse-tracking-kitti-format/ImageSets'
+    image_set_dir = '/data/ck/data/argoverse/argoverse-tracking-kitti-format2/ImageSets'
 
     # # for local testing
     # root_dir = '/Users/ck/data_local/argo/argoverse-tracking'
