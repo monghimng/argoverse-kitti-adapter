@@ -506,6 +506,7 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
     bar.finish()
     print('Translation finished, processed {} files'.format(i))
 
+
 if __name__ == '__main__':
 
     ####CONFIGURATION#################################################
