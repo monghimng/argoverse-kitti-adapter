@@ -27,6 +27,10 @@ import numpy as np
 import pyntcloud
 import progressbar
 from time import sleep
+import cv2
+import pygame
+import matplotlib.pyplot as plt
+import json
 
 """
 Your original file directory is:
@@ -129,7 +133,153 @@ def construct_calib_str(calibration_data):
     file_content = "\n".join([L1, L2, L3, L4, L5, L6, L7])
     return file_content
 
-def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
+def replace_nan_by_closest(Data):
+    """
+    From https://stackoverflow.com/questions/9537543/replace-nans-in-numpy-array-with-closest-non-nan-value.
+
+    Replace any nan in the array by the first occurrence to the right, or to the left if none exists.
+    Args:
+        Data (): Array of interest. NOTE WE ONLY TESTED WITH 1D AND 2D ARRAY.
+
+    Returns:
+        The same array but with nan replaced.
+    """
+    nansIndx = np.where(np.isnan(Data))[0]
+    isanIndx = np.where(~np.isnan(Data))[0]
+    for nan in nansIndx:
+        replacementCandidates = np.where(isanIndx>nan)[0]
+        if replacementCandidates.size != 0:
+            replacement = Data[isanIndx[replacementCandidates[0]]]
+        else:
+            replacement = Data[isanIndx[np.where(isanIndx<nan)[0][-1]]]
+        Data[nan] = replacement
+    return Data
+
+def has_nan(arr):
+    return np.isnan(arr).any()
+
+def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_per_pixel, drivable_save_path,
+            wanted_classes, wanted_save_paths, visualize=True):
+
+    # output bev image setting
+    bnd_width = bnds[1] - bnds[0]
+    bnd_height = bnds[3] - bnds[2]
+    img_width = bnd_width / meter_per_pixel
+    img_height = bnd_height / meter_per_pixel
+    if img_width != 400 or img_height != 400:
+        print(img_width, img_height)
+
+    # intput argoverse log and frame setting
+    city_name = argoverse_data.city_name
+    se3 = argoverse_data.get_pose(frame_index)
+    x, y, _ = argoverse_data.get_pose(frame_index).translation
+    bnds = bnds + np.array([x, x, y, y])
+    polys = argoverse_map.find_local_driveable_areas(bnds, city_name)
+
+    bev_drivable = pygame.Surface([img_height, img_width])
+    bev_all = pygame.Surface([img_height, img_width])
+    for poly_city in polys[1:]:
+
+        # for some reason, the height dimension of the polygons sometimes might have NaN values
+        # we simply replace them by the cloest values to the right
+        if has_nan(poly_city):
+            poly_city[:, 2] = replace_nan_by_closest(poly_city[:, 2])
+
+        # transform the polygons from the city coordinate to the ego vehicle coordinate
+        poly_ego = se3.inverse_transform_point_cloud(poly_city)
+
+        # project to 2d plane, now of shape [n, 2]
+        poly_ego_projected = np.array(poly_ego[:, :2])
+
+        # in the ego coord, +x is going up and +y is to the left, but in BEV image
+        # we expect +x (increment in rows) is going down and +y is to the right.
+        # Therefore, we flip both coordinate
+        poly_ego_projected *= -1
+
+        # move origin to the center of the image
+        poly_ego_projected += np.array(bnd_height // 2, bnd_width)
+
+        # map the polygon to pixel coordinate on the image so that we can draw it
+        pixels = poly_ego_projected / meter_per_pixel
+
+        # note the color only matters for visualization
+        pygame.draw.polygon(bev_drivable, [255, 0, 0], pixels)
+        pygame.draw.polygon(bev_all, [255, 0, 0], pixels)
+
+    # get the objects of a frame
+    object_records = argoverse_data.get_label_object(frame_index)
+
+    bev_classes = []  # object class name mapped to the surface of that class
+    for object_cls in wanted_classes:
+
+        bev = pygame.Surface([img_height, img_width])
+
+        # get 8 corners of each object
+        # bboxes_corners is of shape [N, 8, 3] where N is the num of objects and 8 are the 8 corners
+        bboxes_corners = np.array([r.as_3d_bbox() for r in object_records if r.label_class == object_cls])
+
+        # in case there were no object of that class, we still generate empty bev image
+        if len(bboxes_corners) > 0:
+
+            # determine the top 4 corners
+            # from https://argoai.github.io/argoverse-api/argoverse.data_loading.html?highlight=corners#argoverse.data_loading.object_label_record.ObjectLabelRecord.as_3d_bbox,
+            # we know the corners are ordered, and corner 0, 1, 5, 4 are the top 4 corners that would generate a polygon (IN THAT ORDER!)
+            # we also remove the height dimension (which is the z dimension in xyz)
+            corner_indices = 0, 1, 5, 4
+            bboxes_4corners = bboxes_corners[:, corner_indices, :2]  # of size [N, 4, 2]
+
+            # in the ego coord, +x is going up and +y is to the left, but in BEV image
+            # we expect +x (increment in rows) is going down and +y is to the right.
+            # Therefore, we flip both coordinate
+            bboxes_4corners *= -1
+
+            # move origin to the center of the image
+            bboxes_4corners += np.array(bnd_height // 2, bnd_width)
+
+            # map the polygon to pixel coordinate on the image so that we can draw it
+            bboxes_4corners_pixels = bboxes_4corners / meter_per_pixel
+
+            for bbox in bboxes_4corners_pixels:
+                # note the color only matters for visualization
+                pygame.draw.polygon(bev, [0, 255, 0], bbox)
+                pygame.draw.polygon(bev_all, [0, 255, 0], bbox)
+
+        bev_classes.append(bev)
+
+    # save drivable bev images to paths
+    if drivable_save_path:
+        # convert the pygame surface to binary array
+        img_drivable = pygame.surfarray.array2d(bev_drivable)
+        img_drivable[img_drivable != 0] = 1
+
+        # flip 0 and 1 because the polygons
+        # were actually given as NON-drivable region
+        img_drivable = 1 - img_drivable
+
+        cv2.imwrite(drivable_save_path, img_drivable)
+
+    # save bev images to paths, for all wanted classes
+    if wanted_save_paths:
+
+        for bev_cls, cls_save_path in zip(bev_classes, wanted_save_paths):
+            # convert the pygame surface to binary array
+            img_cls = pygame.surfarray.array2d(bev_cls)
+            img_cls[img_cls != 0] = 1
+
+            cv2.imwrite(cls_save_path, img_cls)
+
+    # visualize BEV outputs and camera images, useful when debugging in notebook
+    if visualize:
+        img = pygame.surfarray.array3d(bev_all)
+        plt.figure()
+        plt.imshow(img)
+
+        import argoverse.visualization.visualization_utils as viz_util
+        f, ax = viz_util.make_grid_ring_camera(argoverse_data, frame_index)
+        plt.show()
+
+def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_meter_per_pixel,
+                    bev_wanted_classes, offset=0):
     """
     Args:
         data_dir: directory that contains data corresponding to A SPECIFIC
@@ -137,6 +287,10 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
         target_data_dir: the dir to write to. Contains data corresponding to
             A SPECIFIC SPLIT in KITTI (training, testing)
         split_file_path: location to write all the sample_idx of a split
+        bev_bnds: [4] containing [x_min, x_max, y_min, y_max] in meter for the bev
+        bev_meter_per_pixel: number of meters in a pixel in bev, most often fractional
+        bev_wanted_classes: [VEHICLE, BICYCLIST, PEDESTRIAN, ...] the classes to be
+            for bev
         offset: first sample_idx to start counting from, needed to differentiate
             training and validation sample_idx because in KITTI they are under
             the same dir
@@ -156,6 +310,16 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
     os.makedirs(target_image_2_dir, exist_ok=True)
     if 'test' not in split_file_path:
         os.makedirs(target_label_2_dir, exist_ok=True)
+
+    ############################## for BEV segmentation masks
+    target_bev_drivable_dir = os.path.join(target_data_dir, 'bev_DRIVABLE')
+    os.makedirs(target_bev_drivable_dir, exist_ok=True)
+    target_bev_cls_dirs = []
+    for wanted_cls in bev_wanted_classes:
+        target_bev_cls_dir = os.path.join(target_data_dir, 'bev_{}'.format(wanted_cls))
+        os.makedirs(target_bev_cls_dir, exist_ok=True)
+        target_bev_cls_dirs.append(target_bev_cls_dir)
+    ############################## end for BEV segmentation masks
 
     # Check the number of logs, defined as one continuous trajectory
     argoverse_loader = ArgoverseTrackingLoader(data_dir)
@@ -193,26 +357,34 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
     bar.start()
 
     i = 0
+    kitti_to_argo_mapping = {}
     for log_id in sorted(argoverse_loader.log_list):
         argoverse_data = argoverse_loader.get(log_id)
+        from argoverse.map_representation.map_api import ArgoverseMap
+        argoverse_map = ArgoverseMap()
         for cam in cams:
-            # Recreate the calibration file content
+
+            ############################## Calibration for this whole log ##############################
             log_calib_path = os.path.join(data_dir, log_id, 'vehicle_calibration_info.json')
             calibration_data = calibration.load_calib(log_calib_path)[cam]
             calib_file_content = construct_calib_str(calibration_data)
 
-            l = 0
-
             log_lidar_dir = os.path.join(data_dir, log_id, 'lidar')
 
             # Loop through the each lidar frame (10Hz) to copy and reconfigure all images, lidars, calibration files, and label files.
-            for timestamp in argoverse_data.lidar_timestamp_list:
+            for frame_idx, timestamp in enumerate(sorted(argoverse_data.lidar_timestamp_list)):
 
-                # import pdb;pdb.set_trace()
                 idx = str(i + offset).zfill(9)
+
+                # recording the mapping from kitti to argo
+                # log index and the lidar frame index uniquely identify a sample
+                kitti_to_argo_mapping[idx] = (log_id, frame_idx)
+
                 i += 1
                 if i < total_number:
                     bar.update(i + 1)
+
+                ############################## Lidar ##############################
 
                 # Save lidar file into .bin format under the new directory
                 lidar_file_path = os.path.join(log_lidar_dir, 'PC_{}.ply'.format(str(timestamp)))
@@ -223,8 +395,10 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
                 lidar_data_augmented = lidar_data_augmented.astype('float32')
                 lidar_data_augmented.tofile(target_lidar_file_path)
 
+                ############################## Image ##############################
+
                 # Save the image file into .png format under the new directory
-                cam_file_path = argoverse_data.image_list_sync[cam][l]
+                cam_file_path = argoverse_data.image_list_sync[cam][frame_idx]
                 target_cam_file_path = os.path.join(target_image_2_dir, idx + '.png')
                 copyfile(cam_file_path, target_cam_file_path)
 
@@ -233,14 +407,21 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
                 file.write(calib_file_content)
                 file.close()
 
+                ############################## BEV binary masks ##############################
+                bev_drivable_save_path = os.path.join(target_bev_drivable_dir, idx + '.png')
+                bev_wanted_save_paths = [os.path.join(cls_dir, idx + '.png') for cls_dir in target_bev_cls_dirs]
+                get_bev(argoverse_data, argoverse_map, log_id, frame_idx, bev_bnds, bev_meter_per_pixel,
+                        bev_drivable_save_path, bev_wanted_classes, bev_wanted_save_paths, visualize=False)
+
+                ############################## Labels ##############################
+
                 if 'test' in split_file_path:
                     continue
-                label_object_list = argoverse_data.get_label_object(l)
+                label_object_list = argoverse_data.get_label_object(frame_idx)
                 target_label_2_file_path = os.path.join(target_label_2_dir, idx + '.txt')
                 file = open(target_label_2_file_path, 'w+')
-                l += 1
 
-                # DontCare objects must appear at the end in KITTI
+                # DontCare objects must appear at the end as per KITTI label files
                 object_lines = []
                 dontcare_lines = []
 
@@ -274,11 +455,10 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
                         # for the orientation, we choose point 1 and point 5 for application
                         p1 = corners_cam_frame[1]
                         p5 = corners_cam_frame[5]
-                        dz = p1[2] - p5[2]
-                        dx = p1[0] - p5[0]
-                        angle = math.atan2(dz, dx)
+                        # dz = p1[2] - p5[2]
+                        # dx = p1[0] - p5[0]
+                        # angle = math.atan2(dz, dx)
 
-                        # todo
                         angle_vec = p1 - p5
                         # norm vec along the x axis, points to the right in KITTI cam rect coordinate
                         origin_vec = np.array([1, 0, 0])
@@ -313,71 +493,108 @@ def process_a_split(data_dir, target_data_dir, split_file_path, offset=0):
                     file.write(line)
                 file.close()
 
+    # write kitti_to_argo_mapping to a file
+    split_dir = os.path.dirname(split_file_path)
+    split_name = os.path.basename(split_file_path)
+    split_name = os.path.splitext(split_name)[0]
+    prefix = 'kitti_to_argo_mapping'
+    kitti_to_argo_mapping_path = os.path.join(split_dir, "{}_{}.json".format(prefix, split_name))
+    file_handle = open(kitti_to_argo_mapping_path, 'w')
+    json.dump(kitti_to_argo_mapping, file_handle)
+    file_handle.close()
+
     bar.finish()
     print('Translation finished, processed {} files'.format(i))
 
+if __name__ == '__main__':
 
-####CONFIGURATION#################################################
-# Root directory
-root_dir = '/data/ck/data/argoverse/argoverse-tracking'
-# Maximum thresholding distance for labelled objects
-# (Object beyond this distance will not be labelled)
-max_d = 50
-split = "train"  # one of train, val, and test
+    ####CONFIGURATION#################################################
+    # Root directory
+    root_dir = '/data/ck/data/argoverse/argoverse-tracking'
+    # Maximum thresholding distance for labelled objects
+    # (Object beyond this distance will not be labelled)
+    max_d = 50
+    split = "train"  # one of train, val, and test
 
-# argoverse object class to KITTI
-car = 'Car'
-ped = 'Pedestrian'
-cyc = 'Cyclist'
+    # argoverse object class to KITTI
+    car = 'Car'
+    ped = 'Pedestrian'
+    cyc = 'Cyclist'
+    # essentially only keep standard sized car, pedestrians, and cyclist.
+    OBJ_CLASS_MAPPING_DICT = {
+        "VEHICLE": car,
+        "PEDESTRIAN": ped,
+        "BICYCLIST": cyc,
+        "EMERGENCY_VEHICLE": DONT_CARE,
+        "BUS": DONT_CARE,
+        "LARGE_VEHICLE": DONT_CARE,
+        "ON_ROAD_OBSTACLE": DONT_CARE,
+        "BICYCLE": DONT_CARE,
+        "OTHER_MOVER": DONT_CARE,
+        "TRAILER": DONT_CARE,
+        "MOTORCYCLIST": DONT_CARE,
+        "MOPED": DONT_CARE,
+        "MOTORCYCLE": DONT_CARE,
+        "STROLLER": DONT_CARE,
+        "ANIMAL": DONT_CARE,
+        "WHEELCHAIR": DONT_CARE,
+        "SCHOOL_BUS": DONT_CARE,
+    }
+    # the range of the BEV mask, in meters, in the coordinate sys of ego vehicle in argo
+    # namely, x is forward facing wrt to the car, and y is sideway facing wrt to the car
+    # we assume the difference max - min is even integer in meter in the following calculation
+    bnd = 50.0
+    bev_bnds = np.array([-bnd, +bnd, -bnd, +bnd], dtype=np.float32)
+    bev_meter_per_pixel = 0.25 # resolution is 0.25 meter per pixel
 
-# essentially only keep standard sized car, pedestrians, and cyclist.
-OBJ_CLASS_MAPPING_DICT = {
-    "VEHICLE": car,
-    "PEDESTRIAN": ped,
-    "BICYCLIST": cyc,
-    "EMERGENCY_VEHICLE": DONT_CARE,
-    "BUS": DONT_CARE,
-    "LARGE_VEHICLE": DONT_CARE,
-    "ON_ROAD_OBSTACLE": DONT_CARE,
-    "BICYCLE": DONT_CARE,
-    "OTHER_MOVER": DONT_CARE,
-    "TRAILER": DONT_CARE,
-    "MOTORCYCLIST": DONT_CARE,
-    "MOPED": DONT_CARE,
-    "MOTORCYCLE": DONT_CARE,
-    "STROLLER": DONT_CARE,
-    "ANIMAL": DONT_CARE,
-    "WHEELCHAIR": DONT_CARE,
-    "SCHOOL_BUS": DONT_CARE,
-}
-####################################################################
+    # the 7 object classes detailed in the cambridge paper, and the drivable region, we also do bicyclist here
+    # because it is ood that cambridge paper only did bicycle
+    bev_wanted_classes = [
+        "BICYCLE",
+        "BUS",
+        "TRAILER",
+        "MOTORCYCLIST",
+        "LARGE_VEHICLE",
+        "VEHICLE",
+        "PEDESTRIAN",
+        "BICYCLIST",
+    ]
 
+    root_dir = '/data/ck/data/argoverse/argoverse-tracking'
+    target_dir = '/data/ck/data/argoverse/argoverse-tracking-kitti-format'
+    split_pairs = {
+        'train': 'training',
+        'val': 'training',  # in KITTI, validation data is also in training
+        'test': 'testing'
+    }
+    image_set_dir = '/data/ck/data/argoverse/argoverse-tracking-kitti-format/ImageSets'
 
-root_dir = '/data/ck/data/argoverse/argoverse-tracking'
-target_dir = '/data/ck/data/argoverse/argoverse-tracking-kitti-format'
-split_pairs = {
-    'train': 'training',
-    'val': 'training',  # in KITTI, validation data is also in training
-    'test': 'testing'
-}
-image_set_dir = '/data/ck/data/argoverse/argoverse-tracking-kitti-format/ImageSets'
+    # # for local testing
+    # root_dir = '/Users/ck/data_local/argo/argoverse-tracking'
+    # target_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format'
+    # split_pairs = {
+    #     'sample': 'sample',
+    # }
+    # image_set_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format/ImageSets'
 
-# # for local testing
-# root_dir = '/Users/ck/data_local/argo/argoverse-tracking'
-# target_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format'
-# split_pairs = {
-#     'sample': 'sample',
-# }
-# image_set_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format/ImageSets'
+    # # for local testing using the whole dataset
+    # root_dir = '/Volumes/CK/data/argoverse/argoverse-tracking'
+    # target_dir = '/Volumes/CK/data/argoverse/argoverse-tracking-kitti-format'
+    # split_pairs = {
+    #     'train': 'training',
+    # }
+    # image_set_dir = '/Volumes/CK/data/argoverse//argoverse-tracking-kitti-format/ImageSets'
 
-for k, (src_split, target_split) in enumerate(split_pairs.items()):
-    data_dir = os.path.join(root_dir, src_split)
-    target_data_dir = os.path.join(target_dir, target_split)
-    split_file_path = os.path.join(image_set_dir, src_split + '.txt')
-    offset = k * 100000000
-    process_a_split(data_dir, target_data_dir, split_file_path, offset)
+    for k, (src_split, target_split) in enumerate(split_pairs.items()):
+        data_dir = os.path.join(root_dir, src_split)
+        target_data_dir = os.path.join(target_dir, target_split)
+        split_file_path = os.path.join(image_set_dir, src_split + '.txt')
+        offset = k * 100000000
+        process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds,
+                        bev_meter_per_pixel, bev_wanted_classes, offset=offset)
 
 """
 rm -r ~/data_local/argo/argoverse-tracking-kitti-format/; python ~/BEVSEG/argoverse-kitti-adapter/adapter.py
 rm -r /data/ck/data/argoverse/argoverse-tracking-kitti-format/; python ~/BEVSEG/argoverse-kitti-adapter/adapter.py
+python ~/BEVSEG/argoverse-kitti-adapter/adapter.py
 """
