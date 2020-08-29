@@ -100,7 +100,7 @@ def write_split_file(split_file_path, offset, num_sample):
     with open(split_file_path, 'w')as f:
         f.write(s)
 
-def construct_calib_str(calibration_data, pts_in_cam_coord=True):
+def construct_calib_str(calibration_data, pts_in_cam_ego_coord=True):
     """
     convert the argo calib to KITTI format, and return the kitti calib as a string.
     Args:
@@ -112,7 +112,23 @@ def construct_calib_str(calibration_data, pts_in_cam_coord=True):
     L3 = L3[:-1]
 
     L6 = 'Tr_velo_to_cam: '
-    for k in calibration_data.extrinsic.reshape(1, 16)[0][0:12]:
+    if pts_in_cam_ego_coord:
+        permute_axis = np.array([
+            [0, 0, 1],
+            [1, 0, 0],
+            [0, 1, 0,]
+        ])
+        flip_2_axis = np.array([
+            [1, 0, 0],
+            [0, -1, 0],
+            [0, 0, -1],
+        ])
+        cam_to_cam_ego = np.matmul(flip_2_axis, permute_axis)  # first permute, then flip 2 of the axes
+        extrinsic_mtx = np.zeros([4, 4])
+        extrinsic_mtx[:3, :3] = np.linalg.inv(cam_to_cam_ego)
+    else:
+        extrinsic_mtx = calibration_data.extrinsic
+    for k in extrinsic_mtx.reshape(1, 16)[0][0:12]:
         L6 = L6 + str(k) + ' '
     L6 = L6[:-1]
 
@@ -219,18 +235,17 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
         [camera_img_width - 1, 0, 0.01],  # upper right hand corner of the image, at depth 0.01 meter
         #         [960, 600, 100],
     ])
-    calib = argoverse_data.get_calibration('ring_front_center')
-    fov_corners_ego = calib.project_image_to_ego(fov_corners_uv_depth)
+    fov_corners_ego = camera_calib.project_image_to_ego(fov_corners_uv_depth)
 
     # optionally transform to camera coords, this is required when we use
     # all 7 cameras. To make this code work with the rest of the code, we need to
     # manually change the axes because cam coord uses different rotation and axes orientation.
     # Refer to the Argoverse paper for the diagram on orientations of all coord system.
     if camera_calib:
-        cam = camera_calib.project_ego_to_cam(fov_corners_ego)
-        cam = cam[:, [2, 0, 1]]  # tranpose the xyz
-        cam[:, [1, 2]] *= -1  # flip 2 of the axes
-        fov_corners_ego = cam
+        in_cam_coord = camera_calib.project_ego_to_cam(fov_corners_ego)
+        in_cam_coord = in_cam_coord[:, [2, 0, 1]]  # tranpose the xyz
+        in_cam_coord[:, [1, 2]] *= -1  # flip 2 of the axes
+        fov_corners_ego = in_cam_coord
 
     # project onto BEV by discarding the z dim (height)
     fov_corners_ego = fov_corners_ego[:,:2]
@@ -312,13 +327,13 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
         # bboxes_corners is of shape [N, 8, 3] where N is the num of objects and 8 are the 8 corners
         bboxes_corners = np.array([r.as_3d_bbox() for r in object_records])
 
-        # if camera_calib:
-        #     bboxes_corners = bboxes_corners.reshape([-1, 3])
-        #     cam = camera_calib.project_ego_to_cam(bboxes_corners)
-        #     cam = cam[:, [2, 0, 1]]  # tranpose the xyz
-        #     cam[:, [1, 2]] *= -1  # flip 2 of the axes
-        #     bboxes_corners = cam
-        #     bboxes_corners = bboxes_corners.reshape([-1, 8, 3])
+        if camera_calib:
+            bboxes_corners = bboxes_corners.reshape([-1, 3])
+            cam = camera_calib.project_ego_to_cam(bboxes_corners)
+            cam = cam[:, [2, 0, 1]]  # tranpose the xyz
+            cam[:, [1, 2]] *= -1  # flip 2 of the axes
+            bboxes_corners = cam
+            bboxes_corners = bboxes_corners.reshape([-1, 8, 3])
 
         # in case there were no object of that class, we still generate empty bev image
         if len(bboxes_corners) > 0:
@@ -448,12 +463,12 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
 
     cams = [
         'ring_front_center',
-        # 'ring_front_left',
-        # 'ring_front_right',
-        # 'ring_rear_left',
-        # 'ring_rear_right',
-        # 'ring_side_left',
-        # 'ring_side_right'
+        'ring_front_left',
+        'ring_front_right',
+        'ring_rear_left',
+        'ring_rear_right',
+        'ring_side_left',
+        'ring_side_right'
     ]
 
     # count total number of files
@@ -486,7 +501,7 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
             ############################## Calibration for this whole log ##############################
             log_calib_path = os.path.join(data_dir, log_id, 'vehicle_calibration_info.json')
             calibration_data = calibration.load_calib(log_calib_path)[cam]
-            calib_file_content = construct_calib_str(calibration_data)
+            calib_file_content = construct_calib_str(calibration_data, pts_in_cam_ego_coord=True)
 
             log_lidar_dir = os.path.join(data_dir, log_id, 'lidar')
 
@@ -511,6 +526,14 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
                 target_lidar_file_path = os.path.join(target_velodyne_dir, idx + '.bin')
 
                 lidar_data = load_ply(lidar_file_path)
+
+                # run this block of code only if we are using the cam coord instead of the ego coord
+                if True:
+                    in_cam_coord = calibration_data.project_ego_to_cam(lidar_data)
+                    in_cam_coord = in_cam_coord[:, [2, 0, 1]]  # tranpose the xyz
+                    in_cam_coord[:, [1, 2]] *= -1  # flip 2 of the axes
+                    lidar_data = in_cam_coord
+
                 lidar_data_augmented = np.concatenate((lidar_data, np.zeros([lidar_data.shape[0], 1])), axis=1)
                 lidar_data_augmented = lidar_data_augmented.astype('float32')
                 lidar_data_augmented.tofile(target_lidar_file_path)
@@ -629,6 +652,9 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
     bar.finish()
     print('Translation finished, processed {} files'.format(i))
 
+# when it is old, we are using the old silly projection strategy for debugging reason
+# eventually method should always be set to 'new'
+method = 'new'
 
 if __name__ == '__main__':
 
