@@ -312,6 +312,14 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
         # bboxes_corners is of shape [N, 8, 3] where N is the num of objects and 8 are the 8 corners
         bboxes_corners = np.array([r.as_3d_bbox() for r in object_records])
 
+        # if camera_calib:
+        #     bboxes_corners = bboxes_corners.reshape([-1, 3])
+        #     cam = camera_calib.project_ego_to_cam(bboxes_corners)
+        #     cam = cam[:, [2, 0, 1]]  # tranpose the xyz
+        #     cam[:, [1, 2]] *= -1  # flip 2 of the axes
+        #     bboxes_corners = cam
+        #     bboxes_corners = bboxes_corners.reshape([-1, 8, 3])
+
         # in case there were no object of that class, we still generate empty bev image
         if len(bboxes_corners) > 0:
 
