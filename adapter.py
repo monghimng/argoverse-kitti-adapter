@@ -9,28 +9,20 @@ FILE_NAME_LEN = 9
 DONT_CARE = 'DontCare'
 print('\nLoading files...')
 
-import argoverse
-from argoverse.data_loading.argoverse_tracking_loader import ArgoverseTrackingLoader
-import os
-from shutil import copyfile
-from argoverse.utils import calibration
 import json
-import numpy as np
-from argoverse.utils.calibration import CameraConfig
-from argoverse.utils.cv2_plotting_utils import draw_clipped_line_segment
-from argoverse.utils.se3 import SE3
-from argoverse.utils.transform import quat2rotmat
 import math
 import os
+from shutil import copyfile
 from typing import Union
-import numpy as np
-import pyntcloud
-import progressbar
-from time import sleep
+
 import cv2
-import pygame
 import matplotlib.pyplot as plt
-import json
+import numpy as np
+import progressbar
+import pygame
+import pyntcloud
+from argoverse.data_loading.argoverse_tracking_loader import ArgoverseTrackingLoader
+from argoverse.utils import calibration
 
 """
 Your original file directory is:
@@ -108,7 +100,7 @@ def write_split_file(split_file_path, offset, num_sample):
     with open(split_file_path, 'w')as f:
         f.write(s)
 
-def construct_calib_str(calibration_data):
+def construct_calib_str(calibration_data, pts_in_cam_coord=True):
     """
     convert the argo calib to KITTI format, and return the kitti calib as a string.
     Args:
@@ -194,7 +186,8 @@ def has_pts_in_bbox(pts, bbox, threshold=1):
 
 
 def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_per_pixel, drivable_save_path,
-            wanted_classes, wanted_save_paths, fov_save_path, visualize=True, filter_obj_if_no_pt_bbox=True):
+            wanted_classes, wanted_save_paths, fov_save_path, visualize=True, filter_obj_if_no_pt_bbox=True,
+            camera_calib=None):
     # output bev image setting
     bnd_width = bnds[1] - bnds[0]
     bnd_height = bnds[3] - bnds[2]
@@ -214,7 +207,7 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
     bev_all = pygame.Surface([bev_px_height, bev_px_width])
     bev_fov = pygame.Surface([bev_px_height, bev_px_width])
 
-    ############################## construct the fov mask (1 for bev pixels within camera fov)
+    ############################## construct the fov mask (pixel=1 for bev pixels within camera fov)
     camera_img_width = 1920
 
     # pick 4 points in the image coordinate also with the depths to define the 4 corners of the fov
@@ -227,7 +220,20 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
         #         [960, 600, 100],
     ])
     calib = argoverse_data.get_calibration('ring_front_center')
-    fov_corners_ego = calib.project_image_to_ego(fov_corners_uv_depth)[:, :2]  # discard the z (height)
+    fov_corners_ego = calib.project_image_to_ego(fov_corners_uv_depth)
+
+    # optionally transform to camera coords, this is required when we use
+    # all 7 cameras. To make this code work with the rest of the code, we need to
+    # manually change the axes because cam coord uses different rotation and axes orientation.
+    # Refer to the Argoverse paper for the diagram on orientations of all coord system.
+    if camera_calib:
+        cam = camera_calib.project_ego_to_cam(fov_corners_ego)
+        cam = cam[:, [2, 0, 1]]  # tranpose the xyz
+        cam[:, [1, 2]] *= -1  # flip 2 of the axes
+        fov_corners_ego = cam
+
+    # project onto BEV by discarding the z dim (height)
+    fov_corners_ego = fov_corners_ego[:,:2]
 
     # in the ego coord, +x is going forward and +y is to the left, but in BEV image
     # we expect +x (increment in rows) is going down and +y is to the right.
@@ -254,19 +260,26 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
         # transform the polygons from the city coordinate to the ego vehicle coordinate
         poly_ego = se3.inverse_transform_point_cloud(poly_city)
 
+        # Refer to above for comments
+        if camera_calib:
+            poly_cam = camera_calib.project_ego_to_cam(poly_ego)
+            poly_cam = poly_cam[:, [2, 0, 1]]  # tranpose the xyz
+            poly_cam[:, [1, 2]] *= -1  # flip 2 of the axes
+            poly_ego = poly_cam
+
         # project to 2d plane, now of shape [n, 2]
-        poly_ego_projected = np.array(poly_ego[:, :2])
+        poly_projected = np.array(poly_ego[:, :2])
 
         # in the ego coord, +x is going forward and +y is to the left, but in BEV image
         # we expect +x (increment in rows) is going down and +y is to the right.
         # Therefore, we flip both coordinate
-        poly_ego_projected *= -1
+        poly_projected *= -1
 
         # move origin to the center of the image
-        poly_ego_projected += np.array(bnd_height // 2, bnd_width)
+        poly_centered = poly_projected + np.array(bnd_height // 2, bnd_width)
 
         # map the polygon to pixel coordinate on the image so that we can draw it
-        pixels = poly_ego_projected / meter_per_pixel
+        pixels = poly_centered / meter_per_pixel
 
         # note the color only matters for visualization
         pygame.draw.polygon(bev_drivable, [255, 0, 0], pixels)
@@ -405,7 +418,7 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
     if 'test' not in split_file_path:
         os.makedirs(target_label_2_dir, exist_ok=True)
 
-    ############################## for BEV segmentation masks
+    ############################## for saving BEV segmentation masks paths
     target_bev_drivable_dir = os.path.join(target_data_dir, 'bev_DRIVABLE')
     os.makedirs(target_bev_drivable_dir, exist_ok=True)
 
@@ -417,7 +430,7 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
         target_bev_cls_dir = os.path.join(target_data_dir, 'bev_{}'.format(wanted_cls))
         os.makedirs(target_bev_cls_dir, exist_ok=True)
         target_bev_cls_dirs.append(target_bev_cls_dir)
-    ############################## end for BEV segmentation masks
+    ############################## end for saving BEV segmentation masks paths
 
     # Check the number of logs, defined as one continuous trajectory
     argoverse_loader = ArgoverseTrackingLoader(data_dir)
@@ -469,41 +482,42 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
 
             log_lidar_dir = os.path.join(data_dir, log_id, 'lidar')
 
-            # Loop through the each lidar frame (10Hz) to copy and reconfigure all images, lidars, calibration files, and label files.
+            # Loop through the each lidar frame (10Hz) to rename, copy, and adapt
+            # all images, lidars, calibration files, and label files.
             for frame_idx, timestamp in enumerate(sorted(argoverse_data.lidar_timestamp_list)):
 
                 idx = str(i + offset).zfill(9)
 
                 # recording the mapping from kitti to argo
-                # log index and the lidar frame index uniquely identify a sample
+                # (log index, the lidar frame index) uniquely identify a sample
                 kitti_to_argo_mapping[idx] = (log_id, frame_idx)
 
                 i += 1
                 if i < total_number:
                     bar.update(i + 1)
 
-                # ############################## Lidar ##############################
-                #
-                # # Save lidar file into .bin format under the new directory
-                # lidar_file_path = os.path.join(log_lidar_dir, 'PC_{}.ply'.format(str(timestamp)))
-                # target_lidar_file_path = os.path.join(target_velodyne_dir, idx + '.bin')
-                #
-                # lidar_data = load_ply(lidar_file_path)
-                # lidar_data_augmented = np.concatenate((lidar_data, np.zeros([lidar_data.shape[0], 1])), axis=1)
-                # lidar_data_augmented = lidar_data_augmented.astype('float32')
-                # lidar_data_augmented.tofile(target_lidar_file_path)
-                #
-                # ############################## Image ##############################
-                #
-                # # Save the image file into .png format under the new directory
-                # cam_file_path = argoverse_data.image_list_sync[cam][frame_idx]
-                # target_cam_file_path = os.path.join(target_image_2_dir, idx + '.png')
-                # copyfile(cam_file_path, target_cam_file_path)
-                #
-                # target_calib_file_path = os.path.join(target_calib_dir, idx + '.txt')
-                # file = open(target_calib_file_path, 'w+')
-                # file.write(calib_file_content)
-                # file.close()
+                ############################## Lidar ##############################
+
+                # Save lidar file into .bin format under the new directory
+                lidar_file_path = os.path.join(log_lidar_dir, 'PC_{}.ply'.format(str(timestamp)))
+                target_lidar_file_path = os.path.join(target_velodyne_dir, idx + '.bin')
+
+                lidar_data = load_ply(lidar_file_path)
+                lidar_data_augmented = np.concatenate((lidar_data, np.zeros([lidar_data.shape[0], 1])), axis=1)
+                lidar_data_augmented = lidar_data_augmented.astype('float32')
+                lidar_data_augmented.tofile(target_lidar_file_path)
+
+                ############################## Image ##############################
+
+                # Save the image file into .png format under the new directory
+                cam_file_path = argoverse_data.image_list_sync[cam][frame_idx]
+                target_cam_file_path = os.path.join(target_image_2_dir, idx + '.png')
+                copyfile(cam_file_path, target_cam_file_path)
+
+                target_calib_file_path = os.path.join(target_calib_dir, idx + '.txt')
+                file = open(target_calib_file_path, 'w+')
+                file.write(calib_file_content)
+                file.close()
 
                 ############################## BEV binary masks ##############################
                 bev_drivable_save_path = os.path.join(target_bev_drivable_dir, idx + '.png')
@@ -512,7 +526,7 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
 
                 get_bev(argoverse_data, argoverse_map, log_id, frame_idx, bev_bnds, bev_meter_per_pixel,
                         bev_drivable_save_path, bev_wanted_classes, bev_wanted_save_paths, bev_fov_save_path,
-                        visualize=False)
+                        visualize=False, camera_calib=calibration_data)
 
                 ############################## Labels ##############################
 
@@ -673,11 +687,11 @@ if __name__ == '__main__':
 
     # for local testing
     root_dir = '/Users/ck/data_local/argo/argoverse-tracking'
-    target_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format'
+    target_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format_cameracoord'
     split_pairs = {
         'sample': 'sample',
     }
-    image_set_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format/ImageSets'
+    image_set_dir = os.path.join(target_dir, 'ImageSets')
 
     # # for local testing using the whole dataset
     # root_dir = '/Volumes/CK/data/argoverse/argoverse-tracking'
