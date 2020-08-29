@@ -198,10 +198,10 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
     # output bev image setting
     bnd_width = bnds[1] - bnds[0]
     bnd_height = bnds[3] - bnds[2]
-    img_width = bnd_width / meter_per_pixel
-    img_height = bnd_height / meter_per_pixel
-    if img_width != 400 or img_height != 400:
-        print(img_width, img_height)
+    bev_px_width = bnd_width / meter_per_pixel
+    bev_px_height = bnd_height / meter_per_pixel
+    if bev_px_width != 400 or bev_px_height != 400:
+        print(bev_px_width, bev_px_height)
 
     # intput argoverse log and frame setting
     city_name = argoverse_data.city_name
@@ -210,20 +210,20 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
     bnds = bnds + np.array([x, x, y, y])
     polys = argoverse_map.find_local_driveable_areas(bnds, city_name)
 
-    bev_drivable = pygame.Surface([img_height, img_width])
-    bev_all = pygame.Surface([img_height, img_width])
-    bev_fov = pygame.Surface([img_height, img_width])
+    bev_drivable = pygame.Surface([bev_px_height, bev_px_width])
+    bev_all = pygame.Surface([bev_px_height, bev_px_width])
+    bev_fov = pygame.Surface([bev_px_height, bev_px_width])
 
     ############################## construct the fov mask (1 for bev pixels within camera fov)
-    img_width = 1920
+    camera_img_width = 1920
 
     # pick 4 points in the image coordinate also with the depths to define the 4 corners of the fov
     # uv_depth, where u is the width of the image, v is height of image, depth is how far that obj is
     fov_corners_uv_depth = np.array([
         [0, 0, 0.01],  # upper left hand corner of the image, at depth 0.01 meter
         [0, 0, 100],  # upper left hand corner of the image, at depth 100 meter
-        [img_width - 1, 0, 100],  # upper right hand corner of the image, at depth 100 meter
-        [img_width - 1, 0, 0.01],  # upper right hand corner of the image, at depth 0.01 meter
+        [camera_img_width - 1, 0, 100],  # upper right hand corner of the image, at depth 100 meter
+        [camera_img_width - 1, 0, 0.01],  # upper right hand corner of the image, at depth 0.01 meter
         #         [960, 600, 100],
     ])
     calib = argoverse_data.get_calibration('ring_front_center')
@@ -287,7 +287,7 @@ def get_bev(argoverse_data, argoverse_map, log_index, frame_index, bnds, meter_p
     bev_classes = []  # object class name mapped to the surface of that class
     for object_cls in wanted_classes:
 
-        bev = pygame.Surface([img_height, img_width])
+        bev = pygame.Surface([bev_px_height, bev_px_width])
 
         # filter out other classes
         object_records = [r for r in object_records_all if r.label_class == object_cls]
@@ -513,8 +513,6 @@ def process_a_split(data_dir, target_data_dir, split_file_path, bev_bnds, bev_me
                 get_bev(argoverse_data, argoverse_map, log_id, frame_idx, bev_bnds, bev_meter_per_pixel,
                         bev_drivable_save_path, bev_wanted_classes, bev_wanted_save_paths, bev_fov_save_path,
                         visualize=False)
-                
-                continue
 
                 ############################## Labels ##############################
 
@@ -673,13 +671,13 @@ if __name__ == '__main__':
     }
     image_set_dir = '/data/ck/data/argoverse/argoverse-tracking-kitti-format2/ImageSets'
 
-    # # for local testing
-    # root_dir = '/Users/ck/data_local/argo/argoverse-tracking'
-    # target_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format'
-    # split_pairs = {
-    #     'sample': 'sample',
-    # }
-    # image_set_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format/ImageSets'
+    # for local testing
+    root_dir = '/Users/ck/data_local/argo/argoverse-tracking'
+    target_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format'
+    split_pairs = {
+        'sample': 'sample',
+    }
+    image_set_dir = '/Users/ck/data_local/argo/argoverse-tracking-kitti-format/ImageSets'
 
     # # for local testing using the whole dataset
     # root_dir = '/Volumes/CK/data/argoverse/argoverse-tracking'
